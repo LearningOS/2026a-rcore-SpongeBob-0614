@@ -1,5 +1,4 @@
 //! Types related to task management
-
 use super::TaskContext;
 
 /// The task control block (TCB) of a task.
@@ -9,6 +8,9 @@ pub struct TaskControlBlock {
     pub task_status: TaskStatus,
     /// The task context
     pub task_cx: TaskContext,
+    /// The task counts for sys calls
+    /// AI assistance: per-task statistics design discussed with ChatGPT/Codex.
+    pub syscall_counts: [usize;411],
 }
 
 /// The status of a task

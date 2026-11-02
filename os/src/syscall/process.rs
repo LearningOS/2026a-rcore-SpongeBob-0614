@@ -1,6 +1,6 @@
 //! Process management syscalls
 use crate::{
-    task::{exit_current_and_run_next, suspend_current_and_run_next},
+    task::{exit_current_and_run_next, get_syscall_count, suspend_current_and_run_next},
     timer::get_time_us,
 };
 
@@ -38,8 +38,30 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     0
 }
 
-// TODO: implement the syscall
+// AI assistance: request handling and pointer access discussed/reviewed with ChatGPT/Codex.
+// Reference: https://learningos.cn/rCore-Camp-Guide-2025S/chapter3/5exercise.html
 pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
     trace!("kernel: sys_trace");
+    if _trace_request==2 {
+        return get_syscall_count(_id) as isize
+    }
+
+    if _trace_request == 0 {
+        let _ptr = _id as *const u8;
+        let byte = unsafe{
+            *_ptr
+        };
+        return byte as isize
+    }
+
+    if _trace_request == 1{
+        let ptr = _id as *mut u8;
+        unsafe{
+            *ptr = _data as u8;
+        }
+        return 0
+
+    }
     -1
+
 }
