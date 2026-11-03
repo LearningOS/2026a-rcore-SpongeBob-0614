@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-SpongeBob-0614",
+  "user": "SpongeBob-0614",
+  "totalScore": 500,
+  "chapters": {
+    "ch3": {
+      "points": "7/7",
+      "score": 100,
+      "commit": "2bbc9369eb02a5d5ace99efbd813fa893b7ebf1c"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "41656605409",
+    "runAttempt": "1"
+  }
+}
