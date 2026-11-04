@@ -1,6 +1,6 @@
 //! Types related to task management
 use super::TaskContext;
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::mm::{
     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
 };
@@ -28,6 +28,9 @@ pub struct TaskControlBlock {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Number of calls for each syscall made by this task
+    pub syscall_counts: [usize; MAX_SYSCALL_NUM],
 }
 
 impl TaskControlBlock {
@@ -63,6 +66,7 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
+            syscall_counts: [0; MAX_SYSCALL_NUM],
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();
@@ -78,19 +82,30 @@ impl TaskControlBlock {
     /// change the location of the program break. return None if failed.
     pub fn change_program_brk(&mut self, size: i32) -> Option<usize> {
         let old_break = self.program_brk;
-        let new_brk = self.program_brk as isize + size as isize;
-        if new_brk < self.heap_bottom as isize {
+        let new_brk = if size >= 0 {
+            old_break.checked_add(size as usize)?
+        } else {
+            old_break.checked_sub((size as isize).unsigned_abs())?
+        };
+        let new_va = VirtAddr::from(new_brk);
+        if new_brk < self.heap_bottom || usize::from(new_va) != new_brk
+            || ((new_brk ^ self.heap_bottom) & (1usize << 38)) != 0 {
             return None;
         }
-        let result = if size < 0 {
-            self.memory_set
-                .shrink_to(VirtAddr(self.heap_bottom), VirtAddr(new_brk as usize))
+        // Page differences avoid assuming a single contiguous heap area.
+        let old_end = VirtAddr::from(old_break).ceil();
+        let new_end = new_va.ceil();
+        let result = if new_end < old_end {
+            self.memory_set.unmap_user_pages(new_end, old_end)
+        } else if new_end > old_end {
+            self.memory_set.map_user_pages(
+                old_end, new_end, MapPermission::R | MapPermission::W | MapPermission::U,
+            )
         } else {
-            self.memory_set
-                .append_to(VirtAddr(self.heap_bottom), VirtAddr(new_brk as usize))
+            true
         };
         if result {
-            self.program_brk = new_brk as usize;
+            self.program_brk = new_brk;
             Some(old_break)
         } else {
             None
