@@ -52,6 +52,12 @@ pub struct TaskControlBlockInner {
     /// Maintain the execution status of the current process
     pub task_status: TaskStatus,
 
+    /// Scheduling weight; larger values receive more CPU time.
+    pub priority: usize,
+
+    /// Accumulated stride used to choose the next runnable process.
+    pub stride: u128,
+
     /// Application address space
     pub memory_set: MemorySet,
 
@@ -121,6 +127,8 @@ impl TaskControlBlock {
                     base_size: user_sp,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
+                    priority: 16,
+                    stride: 0,
                     memory_set,
                     parent: None,
                     children: Vec::new(),
@@ -165,6 +173,9 @@ impl TaskControlBlock {
         inner.memory_set = memory_set;
         // update trap_cx ppn
         inner.trap_cx_ppn = trap_cx_ppn;
+        inner.base_size = user_sp;
+        inner.heap_bottom = user_sp;
+        inner.program_brk = user_sp;
         // initialize trap_cx
         let trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -209,6 +220,8 @@ impl TaskControlBlock {
                     base_size: parent_inner.base_size,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
+                    priority: 16,
+                    stride: 0,
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),

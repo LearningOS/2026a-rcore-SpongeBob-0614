@@ -1,5 +1,5 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
-use super::{frame_alloc, FrameTracker};
+use super::{frame_alloc, frame_available, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
@@ -287,6 +287,112 @@ impl MemorySet {
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
+    }
+
+    /// Allocate zero-filled user pages without replacing existing mappings.
+    /// Failed requests release newly allocated data pages and leave existing mappings intact.
+    /// Source: https://learningos.cn/rCore-Tutorial-Guide/chapter4/7exercise.html
+    pub fn map_user_pages(
+        &mut self,
+        start: VirtPageNum,
+        end: VirtPageNum,
+        permission: MapPermission,
+    ) -> bool {
+        if start > end || !permission.contains(MapPermission::U) {
+            return false;
+        }
+        if start == end {
+            return true;
+        }
+        // Even the data pages alone must fit; this also rejects huge requests promptly.
+        if end.0 - start.0 > frame_available() {
+            return false;
+        }
+        let range = VPNRange::new(start, end);
+        for vpn in range {
+            if self.translate(vpn).map_or(false, |pte| pte.is_valid()) {
+                return false;
+            }
+        }
+        let mut area = MapArea {
+            vpn_range: range,
+            data_frames: BTreeMap::new(),
+            map_type: MapType::Framed,
+            map_perm: permission,
+        };
+        let flags = PTEFlags::from_bits(permission.bits).unwrap();
+        for vpn in range {
+            if let Some(frame) = frame_alloc() {
+                if self.page_table.try_map(vpn, frame.ppn, flags) {
+                    area.data_frames.insert(vpn, frame);
+                    continue;
+                }
+            }
+            // Clear newly installed leaves before dropping their owning FrameTrackers.
+            // Empty intermediate page tables remain owned by this PageTable.
+            for mapped_vpn in area.data_frames.keys() {
+                self.page_table.unmap(*mapped_vpn);
+            }
+            return false;
+        }
+        self.areas.push(area);
+        true
+    }
+
+    /// Unmap a fully mapped user range, preserving the parts of areas outside it.
+    /// Validate the entire range before splitting areas or releasing frames.
+    pub fn unmap_user_pages(&mut self, start: VirtPageNum, end: VirtPageNum) -> bool {
+        if start > end {
+            return false;
+        }
+        if start == end {
+            return true;
+        }
+        // Validate the whole request before changing any mapping or releasing frames.
+        for vpn in VPNRange::new(start, end) {
+            match self.translate(vpn) {
+                Some(pte) if pte.is_valid() && pte.flags().contains(PTEFlags::U) => {}
+                _ => return false,
+            }
+            if !self
+                .areas
+                .iter()
+                .any(|area| area.map_type == MapType::Framed && area.data_frames.contains_key(&vpn))
+            {
+                return false;
+            }
+        }
+        let old_areas = core::mem::take(&mut self.areas);
+        for mut area in old_areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            let cut_start = start.max(area_start);
+            let cut_end = end.min(area_end);
+            if cut_start >= cut_end {
+                self.areas.push(area);
+                continue;
+            }
+            let right_frames = area.data_frames.split_off(&cut_end);
+            let removed_frames = area.data_frames.split_off(&cut_start);
+            for vpn in VPNRange::new(cut_start, cut_end) {
+                self.page_table.unmap(vpn);
+            }
+            drop(removed_frames);
+            let permission = area.map_perm;
+            if area_start < cut_start {
+                area.vpn_range = VPNRange::new(area_start, cut_start);
+                self.areas.push(area);
+            }
+            if cut_end < area_end {
+                self.areas.push(MapArea {
+                    vpn_range: VPNRange::new(cut_end, area_end),
+                    data_frames: right_frames,
+                    map_type: MapType::Framed,
+                    map_perm: permission,
+                });
+            }
+        }
+        true
     }
 
     /// shrink the area to new_end

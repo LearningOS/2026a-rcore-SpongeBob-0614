@@ -4,12 +4,16 @@ use crate::sync::UPSafeCell;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use lazy_static::*;
+
+// Larger than any accepted priority, so even isize::MAX makes progress.
+const BIG_STRIDE: u128 = 1u128 << 64;
+
 ///A array of `TaskControlBlock` that is thread-safe
 pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// Stride scheduler with FIFO ordering for equal strides.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
@@ -21,9 +25,29 @@ impl TaskManager {
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
+    /// Choose the smallest stride and charge it for one scheduling turn.
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let (index, min_stride) = self
+            .ready_queue
+            .iter()
+            .enumerate()
+            .map(|(index, task)| (index, task.inner_exclusive_access().stride))
+            .min_by_key(|&(_, stride)| stride)?;
+        let priority = self.ready_queue[index].inner_exclusive_access().priority;
+        let pass = (BIG_STRIDE / priority as u128).max(1);
+
+        if min_stride.checked_add(pass).is_none() {
+            // Every runnable process is in this queue when the processor fetches.
+            // Subtracting their common minimum preserves ordering and differences,
+            // and gives the selected process room for its next stride increment.
+            for task in &self.ready_queue {
+                task.inner_exclusive_access().stride -= min_stride;
+            }
+        }
+
+        let task = self.ready_queue.remove(index).unwrap();
+        task.inner_exclusive_access().stride += pass;
+        Some(task)
     }
 }
 
