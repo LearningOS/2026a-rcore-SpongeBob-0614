@@ -99,7 +99,7 @@ impl PageTable {
                 break;
             }
             if !pte.is_valid() {
-                let frame = frame_alloc().unwrap();
+                let frame = frame_alloc()?;
                 *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
@@ -131,6 +131,18 @@ impl PageTable {
         let pte = self.find_pte_create(vpn).unwrap();
         assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+    }
+
+    /// Map a free page, returning false on an existing mapping or allocation failure.
+    /// Used when a failed allocation must be reported to the caller instead of panicking.
+    pub fn try_map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        if let Some(pte) = self.find_pte_create(vpn) {
+            if !pte.is_valid() {
+                *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+                return true;
+            }
+        }
+        false
     }
     /// remove the map between virtual page number and physical page number
     #[allow(unused)]

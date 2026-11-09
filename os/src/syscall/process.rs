@@ -1,13 +1,21 @@
 //! Process management syscalls
+// 来源与交流：get_time/mmap/munmap 复用本人 ch4 实现并适配进程结构；
+// spawn/priority 参考第五章练习，与 AI 助手讨论并辅助补全、检查。
+// https://learningos.cn/rCore-Tutorial-Guide/chapter5/4exercise.html
 use alloc::sync::Arc;
 
 use crate::{
+    config::PAGE_SIZE,
     loader::get_app_data_by_name,
-    mm::{translated_refmut, translated_str},
-    task::{
-        add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+    mm::{
+        translated_byte_buffer, translated_refmut, translated_str, MapPermission, VirtAddr,
+        VirtPageNum,
     },
+    task::{
+        add_task, current_task, current_user_token, exit_current_and_run_next, map_current_pages,
+        suspend_current_and_run_next, unmap_current_pages, TaskControlBlock,
+    },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -67,7 +75,11 @@ pub fn sys_exec(path: *const u8) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel::pid[{}] sys_waitpid [{}]", current_task().unwrap().pid.0, pid);
+    trace!(
+        "kernel::pid[{}] sys_waitpid [{}]",
+        current_task().unwrap().pid.0,
+        pid
+    );
     let task = current_task().unwrap();
     // find a child process
 
@@ -102,33 +114,110 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
+/// Write the timer value to user memory, including when TimeVal spans two pages.
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+    let _t = get_time_us();
+    let _time_val = TimeVal {
+        sec: _t / 1_000_000,
+        usec: _t % 1_000_000,
+    };
+    let buffers = translated_byte_buffer(
+        current_user_token(),
+        _ts as *const u8,
+        core::mem::size_of::<TimeVal>(),
     );
-    -1
+    let ptr = &_time_val;
+    let src: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            /* 指向 _time_val 的字节指针 */
+            ptr as *const TimeVal as *const u8,
+            /* TimeVal 的字节大小 */
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    trace!(
+        "TimeVal: {:?}, Buffers length: {:?}",
+        _time_val,
+        buffers.len()
+    );
+
+    let mut offset = 0;
+    for buffer in buffers {
+        let len = buffer.len();
+        buffer.copy_from_slice(&src[offset..offset + len]);
+        // 更新 offset
+        offset += len;
+    }
+    0
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+// Range validation for anonymous mappings and unmapping.
+// Source: https://learningos.cn/rCore-Tutorial-Guide/chapter4/7exercise.html
+// Check actual endpoints before VirtAddr truncates them to 39 bits. The exclusive
+// end may be the boundary of a canonical half, so validate end - 1 instead.
+fn user_page_range(start: usize, len: usize) -> Option<(VirtPageNum, VirtPageNum)> {
+    if len == 0 || start % PAGE_SIZE != 0 {
+        return None;
+    }
+    let end = start.checked_add(len)?;
+    let last = end - 1;
+    let start_va = VirtAddr::from(start);
+    let last_va = VirtAddr::from(last);
+    if usize::from(start_va) != start
+        || usize::from(last_va) != last
+        || ((start ^ last) & (1usize << 38)) != 0
+    {
+        return None;
+    }
+    Some((start_va.floor(), VirtPageNum(last_va.floor().0 + 1)))
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Allocate anonymous user pages with the requested read/write/execute permissions.
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    if start % PAGE_SIZE != 0 || (prot & 0b111) == 0 || (prot & !0b111) != 0 {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let (start_vpn, end_vpn) = match user_page_range(start, len) {
+        Some(range) => range,
+        None => return -1,
+    };
+    let mut permission = MapPermission::U;
+    if prot & 1 != 0 {
+        permission |= MapPermission::R;
+    }
+    if prot & 2 != 0 {
+        permission |= MapPermission::W;
+    }
+    if prot & 4 != 0 {
+        permission |= MapPermission::X;
+    }
+    if map_current_pages(start_vpn, end_vpn, permission) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Remove all user mappings covering a page-aligned byte range.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let (start_vpn, end_vpn) = match user_page_range(start, len) {
+        Some(range) => range,
+        None => return -1,
+    };
+    if unmap_current_pages(start_vpn, end_vpn) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -141,21 +230,32 @@ pub fn sys_sbrk(size: i32) -> isize {
     }
 }
 
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Create a child directly from its ELF without copying the parent's address space.
+pub fn sys_spawn(path: *const u8) -> isize {
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let parent = current_task().unwrap();
+        let new_task = Arc::new(TaskControlBlock::new(data));
+        let new_pid = new_task.getpid();
+        new_task.inner_exclusive_access().parent = Some(Arc::downgrade(&parent));
+        parent
+            .inner_exclusive_access()
+            .children
+            .push(new_task.clone());
+        add_task(new_task);
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Set the current process's scheduling priority; values below two are invalid.
+pub fn sys_set_priority(prio: isize) -> isize {
+    if prio < 2 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    task.inner_exclusive_access().priority = prio as usize;
+    prio
 }
